@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-carafe"
-version = "0.1.0"
+version = "0.1.1"
 description = "CARAFE content-aware upsampling for Apple Silicon (MPS)"
 readme = "README.md"
 license = "MIT"
