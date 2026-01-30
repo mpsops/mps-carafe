@@ -11,6 +11,7 @@ static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
 static id<MTLComputePipelineState> g_carafe_forward_fp32 = nil;
 static id<MTLComputePipelineState> g_carafe_forward_fp16 = nil;
+static id<MTLComputePipelineState> g_carafe_forward_bf16 = nil;
 static id<MTLComputePipelineState> g_carafe_backward_features_fp32 = nil;
 static id<MTLComputePipelineState> g_carafe_backward_masks_fp32 = nil;
 
@@ -18,8 +19,7 @@ static const char* METAL_SHADER = R"(
 #include <metal_stdlib>
 using namespace metal;
 
-// CARAFE forward kernel
-// For each output pixel, gather from input using the reassembly mask
+// CARAFE forward kernel - FP32
 kernel void carafe_forward_fp32(
     device const float* features [[buffer(0)]],
     device const float* masks [[buffer(1)]],
@@ -37,7 +37,7 @@ kernel void carafe_forward_fp32(
 ) {
     int ow = gid.x;
     int oh = gid.y;
-    int bc = gid.z;  // batch * channels
+    int bc = gid.z;
 
     int b = bc / channels;
     int c = bc % channels;
@@ -47,14 +47,12 @@ kernel void carafe_forward_fp32(
     int group_channels = channels / group_size;
     int g = c / group_channels;
 
-    // Input pixel position (center of the kernel)
     int ih = oh / scale_factor;
     int iw = ow / scale_factor;
 
     int k_half = kernel_size / 2;
     float sum = 0.0f;
 
-    // Gather from neighborhood using mask weights
     for (int ky = 0; ky < kernel_size; ky++) {
         for (int kx = 0; kx < kernel_size; kx++) {
             int iy = ih + ky - k_half;
@@ -67,7 +65,6 @@ kernel void carafe_forward_fp32(
                                    iy * in_width + ix];
             }
 
-            // Mask index: (batch, group * k^2, out_h, out_w)
             int mask_c = g * kernel_size * kernel_size + ky * kernel_size + kx;
             float mask_val = masks[b * group_size * kernel_size * kernel_size * out_height * out_width +
                                    mask_c * out_height * out_width +
@@ -82,6 +79,7 @@ kernel void carafe_forward_fp32(
            oh * out_width + ow] = sum;
 }
 
+// CARAFE forward kernel - FP16
 kernel void carafe_forward_fp16(
     device const half* features [[buffer(0)]],
     device const half* masks [[buffer(1)]],
@@ -141,8 +139,68 @@ kernel void carafe_forward_fp16(
            oh * out_width + ow] = half(sum);
 }
 
+// CARAFE forward kernel - BF16 (native bfloat16 support)
+kernel void carafe_forward_bf16(
+    device const bfloat* features [[buffer(0)]],
+    device const bfloat* masks [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant int& batch [[buffer(3)]],
+    constant int& channels [[buffer(4)]],
+    constant int& in_height [[buffer(5)]],
+    constant int& in_width [[buffer(6)]],
+    constant int& out_height [[buffer(7)]],
+    constant int& out_width [[buffer(8)]],
+    constant int& kernel_size [[buffer(9)]],
+    constant int& group_size [[buffer(10)]],
+    constant int& scale_factor [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int ow = gid.x;
+    int oh = gid.y;
+    int bc = gid.z;
+
+    int b = bc / channels;
+    int c = bc % channels;
+
+    if (ow >= out_width || oh >= out_height || b >= batch) return;
+
+    int group_channels = channels / group_size;
+    int g = c / group_channels;
+
+    int ih = oh / scale_factor;
+    int iw = ow / scale_factor;
+
+    int k_half = kernel_size / 2;
+    float sum = 0.0f;
+
+    for (int ky = 0; ky < kernel_size; ky++) {
+        for (int kx = 0; kx < kernel_size; kx++) {
+            int iy = ih + ky - k_half;
+            int ix = iw + kx - k_half;
+
+            float feat_val = 0.0f;
+            if (iy >= 0 && iy < in_height && ix >= 0 && ix < in_width) {
+                feat_val = float(features[b * channels * in_height * in_width +
+                                         c * in_height * in_width +
+                                         iy * in_width + ix]);
+            }
+
+            int mask_c = g * kernel_size * kernel_size + ky * kernel_size + kx;
+            float mask_val = float(masks[b * group_size * kernel_size * kernel_size * out_height * out_width +
+                                        mask_c * out_height * out_width +
+                                        oh * out_width + ow]);
+
+            sum += feat_val * mask_val;
+        }
+    }
+
+    output[b * channels * out_height * out_width +
+           c * out_height * out_width +
+           oh * out_width + ow] = bfloat(sum);
+}
+
 // Backward for features - scatter gradients from output to input
-// Note: Uses atomic_float, no atomic_half in Metal, so backward always FP32
+// Note: Uses atomic_float, no atomic_half/atomic_bfloat in Metal, so backward always FP32
 kernel void carafe_backward_features_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* masks [[buffer(1)]],
@@ -158,7 +216,6 @@ kernel void carafe_backward_features_fp32(
     constant int& scale_factor [[buffer(11)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
-    // Each thread handles one output position
     int ow = gid.x;
     int oh = gid.y;
     int bc = gid.z;
@@ -180,7 +237,6 @@ kernel void carafe_backward_features_fp32(
                                      c * out_height * out_width +
                                      oh * out_width + ow];
 
-    // Scatter gradient to input positions
     for (int ky = 0; ky < kernel_size; ky++) {
         for (int kx = 0; kx < kernel_size; kx++) {
             int iy = ih + ky - k_half;
@@ -217,10 +273,9 @@ kernel void carafe_backward_masks_fp32(
     constant int& scale_factor [[buffer(11)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
-    // Each thread handles one mask position
     int ow = gid.x;
     int oh = gid.y;
-    int bk = gid.z;  // batch * (group_size * kernel_size^2)
+    int bk = gid.z;
 
     int mask_channels = group_size * kernel_size * kernel_size;
     int b = bk / mask_channels;
@@ -243,7 +298,6 @@ kernel void carafe_backward_masks_fp32(
     int group_channels = channels / group_size;
     float grad_sum = 0.0f;
 
-    // Sum over channels in this group
     for (int gc = 0; gc < group_channels; gc++) {
         int c = g * group_channels + gc;
 
@@ -283,11 +337,13 @@ static void ensure_initialized() {
 
     id<MTLFunction> fwd_fp32 = [g_library newFunctionWithName:@"carafe_forward_fp32"];
     id<MTLFunction> fwd_fp16 = [g_library newFunctionWithName:@"carafe_forward_fp16"];
+    id<MTLFunction> fwd_bf16 = [g_library newFunctionWithName:@"carafe_forward_bf16"];
     id<MTLFunction> bwd_feat = [g_library newFunctionWithName:@"carafe_backward_features_fp32"];
     id<MTLFunction> bwd_mask = [g_library newFunctionWithName:@"carafe_backward_masks_fp32"];
 
     g_carafe_forward_fp32 = [g_device newComputePipelineStateWithFunction:fwd_fp32 error:&error];
     g_carafe_forward_fp16 = [g_device newComputePipelineStateWithFunction:fwd_fp16 error:&error];
+    g_carafe_forward_bf16 = [g_device newComputePipelineStateWithFunction:fwd_bf16 error:&error];
     g_carafe_backward_features_fp32 = [g_device newComputePipelineStateWithFunction:bwd_feat error:&error];
     g_carafe_backward_masks_fp32 = [g_device newComputePipelineStateWithFunction:bwd_mask error:&error];
 }
@@ -319,24 +375,13 @@ torch::Tensor carafe_forward_mps(
     TORCH_CHECK(masks.size(3) == out_width, "masks width mismatch");
     TORCH_CHECK(channels % group_size == 0, "channels must be divisible by group_size");
 
-    // Handle BF16: convert to FP32 for kernel, convert output back
-    bool is_bfloat16 = features.scalar_type() == at::kBFloat16;
-    at::ScalarType orig_dtype = features.scalar_type();
-
-    auto features_work = features.contiguous();
-    auto masks_work = masks.contiguous();
-
-    // Convert BF16 to FP32 for kernel execution
-    if (is_bfloat16) {
-        features_work = features_work.to(at::kFloat);
-        masks_work = masks_work.to(at::kFloat);
-    }
-
-    auto output = torch::zeros({batch, channels, out_height, out_width}, features_work.options());
+    auto features_contig = features.contiguous();
+    auto masks_contig = masks.contiguous();
+    auto output = torch::zeros({batch, channels, out_height, out_width}, features_contig.options());
 
     // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
-    id<MTLBuffer> features_buf = at::native::mps::getMTLBufferStorage(features_work);
-    id<MTLBuffer> masks_buf = at::native::mps::getMTLBufferStorage(masks_work);
+    id<MTLBuffer> features_buf = at::native::mps::getMTLBufferStorage(features_contig);
+    id<MTLBuffer> masks_buf = at::native::mps::getMTLBufferStorage(masks_contig);
     id<MTLBuffer> output_buf = at::native::mps::getMTLBufferStorage(output);
 
     // Use PyTorch's MPS stream command encoder (zero-sync)
@@ -344,14 +389,21 @@ torch::Tensor carafe_forward_mps(
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool use_fp16 = features_work.scalar_type() == at::kHalf;
-        id<MTLComputePipelineState> pso = use_fp16 ? g_carafe_forward_fp16 : g_carafe_forward_fp32;
+        // Select kernel based on dtype - native support for FP32, FP16, BF16
+        id<MTLComputePipelineState> pso;
+        if (features_contig.scalar_type() == at::kHalf) {
+            pso = g_carafe_forward_fp16;
+        } else if (features_contig.scalar_type() == at::kBFloat16) {
+            pso = g_carafe_forward_bf16;
+        } else {
+            pso = g_carafe_forward_fp32;
+        }
 
         [encoder setComputePipelineState:pso];
         [encoder setBuffer:features_buf
-                    offset:features_work.storage_offset() * features_work.element_size() atIndex:0];
+                    offset:features_contig.storage_offset() * features_contig.element_size() atIndex:0];
         [encoder setBuffer:masks_buf
-                    offset:masks_work.storage_offset() * masks_work.element_size() atIndex:1];
+                    offset:masks_contig.storage_offset() * masks_contig.element_size() atIndex:1];
         [encoder setBuffer:output_buf
                     offset:output.storage_offset() * output.element_size() atIndex:2];
 
@@ -368,13 +420,6 @@ torch::Tensor carafe_forward_mps(
         MTLSize gridSize = MTLSizeMake(out_width, out_height, batch * channels);
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
-
-        // No endEncoding/commit - PyTorch manages encoder lifecycle
-    }
-
-    // Convert output back to original dtype (BF16)
-    if (is_bfloat16) {
-        output = output.to(orig_dtype);
     }
 
     return output;
@@ -399,7 +444,7 @@ std::tuple<torch::Tensor, torch::Tensor> carafe_backward_mps(
     int out_width = in_width * scale_factor;
     int mask_channels = group_size * kernel_size * kernel_size;
 
-    // Backward always uses FP32 kernel (Metal doesn't have atomic_half)
+    // Backward always uses FP32 kernel (Metal doesn't have atomic_half/atomic_bfloat)
     at::ScalarType orig_dtype = features.scalar_type();
 
     auto grad_output_f = grad_output.to(at::kFloat).contiguous();
@@ -442,7 +487,7 @@ std::tuple<torch::Tensor, torch::Tensor> carafe_backward_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Backward for masks - dispatch on same encoder
+        // Backward for masks
         [encoder setComputePipelineState:g_carafe_backward_masks_fp32];
         [encoder setBuffer:grad_out_buf offset:grad_output_f.storage_offset() * grad_output_f.element_size() atIndex:0];
         [encoder setBuffer:features_buf offset:features_f.storage_offset() * features_f.element_size() atIndex:1];
@@ -460,8 +505,6 @@ std::tuple<torch::Tensor, torch::Tensor> carafe_backward_mps(
 
         gridSize = MTLSizeMake(out_width, out_height, batch * mask_channels);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
-
-        // No endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return std::make_tuple(
