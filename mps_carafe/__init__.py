@@ -10,7 +10,7 @@ from torch import nn, Tensor
 from torch.autograd import Function
 from typing import Tuple
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 def _load_library():

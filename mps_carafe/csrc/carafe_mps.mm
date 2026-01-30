@@ -2,6 +2,7 @@
 // Used in Mask R-CNN, FPN, and other detection/segmentation networks
 
 #include <torch/extension.h>
+#include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
@@ -141,6 +142,7 @@ kernel void carafe_forward_fp16(
 }
 
 // Backward for features - scatter gradients from output to input
+// Note: Uses atomic_float, no atomic_half in Metal, so backward always FP32
 kernel void carafe_backward_features_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* masks [[buffer(1)]],
@@ -317,23 +319,41 @@ torch::Tensor carafe_forward_mps(
     TORCH_CHECK(masks.size(3) == out_width, "masks width mismatch");
     TORCH_CHECK(channels % group_size == 0, "channels must be divisible by group_size");
 
-    auto output = torch::zeros({batch, channels, out_height, out_width}, features.options());
+    // Handle BF16: convert to FP32 for kernel, convert output back
+    bool is_bfloat16 = features.scalar_type() == at::kBFloat16;
+    at::ScalarType orig_dtype = features.scalar_type();
 
-    auto features_contig = features.contiguous();
-    auto masks_contig = masks.contiguous();
+    auto features_work = features.contiguous();
+    auto masks_work = masks.contiguous();
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Convert BF16 to FP32 for kernel execution
+    if (is_bfloat16) {
+        features_work = features_work.to(at::kFloat);
+        masks_work = masks_work.to(at::kFloat);
+    }
+
+    auto output = torch::zeros({batch, channels, out_height, out_width}, features_work.options());
+
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> features_buf = at::native::mps::getMTLBufferStorage(features_work);
+    id<MTLBuffer> masks_buf = at::native::mps::getMTLBufferStorage(masks_work);
+    id<MTLBuffer> output_buf = at::native::mps::getMTLBufferStorage(output);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool is_fp16 = features_contig.scalar_type() == torch::kHalf;
-        id<MTLComputePipelineState> pso = is_fp16 ? g_carafe_forward_fp16 : g_carafe_forward_fp32;
+        bool use_fp16 = features_work.scalar_type() == at::kHalf;
+        id<MTLComputePipelineState> pso = use_fp16 ? g_carafe_forward_fp16 : g_carafe_forward_fp32;
 
         [encoder setComputePipelineState:pso];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(features_contig) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(masks_contig) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:2];
+        [encoder setBuffer:features_buf
+                    offset:features_work.storage_offset() * features_work.element_size() atIndex:0];
+        [encoder setBuffer:masks_buf
+                    offset:masks_work.storage_offset() * masks_work.element_size() atIndex:1];
+        [encoder setBuffer:output_buf
+                    offset:output.storage_offset() * output.element_size() atIndex:2];
 
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&channels length:sizeof(int) atIndex:4];
@@ -349,7 +369,12 @@ torch::Tensor carafe_forward_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
+    }
+
+    // Convert output back to original dtype (BF16)
+    if (is_bfloat16) {
+        output = output.to(orig_dtype);
     }
 
     return output;
@@ -374,24 +399,34 @@ std::tuple<torch::Tensor, torch::Tensor> carafe_backward_mps(
     int out_width = in_width * scale_factor;
     int mask_channels = group_size * kernel_size * kernel_size;
 
-    auto grad_output_f = grad_output.to(torch::kFloat32).contiguous();
-    auto features_f = features.to(torch::kFloat32).contiguous();
-    auto masks_f = masks.to(torch::kFloat32).contiguous();
+    // Backward always uses FP32 kernel (Metal doesn't have atomic_half)
+    at::ScalarType orig_dtype = features.scalar_type();
+
+    auto grad_output_f = grad_output.to(at::kFloat).contiguous();
+    auto features_f = features.to(at::kFloat).contiguous();
+    auto masks_f = masks.to(at::kFloat).contiguous();
 
     auto grad_features = torch::zeros_like(features_f);
     auto grad_masks = torch::zeros({batch, mask_channels, out_height, out_width},
                                    grad_output_f.options());
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> grad_out_buf = at::native::mps::getMTLBufferStorage(grad_output_f);
+    id<MTLBuffer> features_buf = at::native::mps::getMTLBufferStorage(features_f);
+    id<MTLBuffer> masks_buf = at::native::mps::getMTLBufferStorage(masks_f);
+    id<MTLBuffer> grad_feat_buf = at::native::mps::getMTLBufferStorage(grad_features);
+    id<MTLBuffer> grad_mask_buf = at::native::mps::getMTLBufferStorage(grad_masks);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         // Backward for features
         [encoder setComputePipelineState:g_carafe_backward_features_fp32];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(masks_f) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_features) offset:0 atIndex:2];
+        [encoder setBuffer:grad_out_buf offset:grad_output_f.storage_offset() * grad_output_f.element_size() atIndex:0];
+        [encoder setBuffer:masks_buf offset:masks_f.storage_offset() * masks_f.element_size() atIndex:1];
+        [encoder setBuffer:grad_feat_buf offset:grad_features.storage_offset() * grad_features.element_size() atIndex:2];
 
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&channels length:sizeof(int) atIndex:4];
@@ -409,9 +444,9 @@ std::tuple<torch::Tensor, torch::Tensor> carafe_backward_mps(
 
         // Backward for masks - dispatch on same encoder
         [encoder setComputePipelineState:g_carafe_backward_masks_fp32];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(features_f) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_masks) offset:0 atIndex:2];
+        [encoder setBuffer:grad_out_buf offset:grad_output_f.storage_offset() * grad_output_f.element_size() atIndex:0];
+        [encoder setBuffer:features_buf offset:features_f.storage_offset() * features_f.element_size() atIndex:1];
+        [encoder setBuffer:grad_mask_buf offset:grad_masks.storage_offset() * grad_masks.element_size() atIndex:2];
 
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&channels length:sizeof(int) atIndex:4];
@@ -426,11 +461,11 @@ std::tuple<torch::Tensor, torch::Tensor> carafe_backward_mps(
         gridSize = MTLSizeMake(out_width, out_height, batch * mask_channels);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return std::make_tuple(
-        grad_features.to(features.scalar_type()),
+        grad_features.to(orig_dtype),
         grad_masks.to(masks.scalar_type())
     );
 }
