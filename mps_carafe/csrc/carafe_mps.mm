@@ -26,22 +26,6 @@ static const char* METAL_SHADER = R"(
 #include <metal_stdlib>
 using namespace metal;
 
-// Atomic float add using compare-and-swap (works on all Metal versions)
-// This is the standard workaround when atomic_float is not available
-inline void atomic_add_float(device atomic_uint* addr, float value) {
-    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
-    float current_val = as_type<float>(expected);
-    float new_val = current_val + value;
-    uint new_bits = as_type<uint>(new_val);
-
-    while (!atomic_compare_exchange_weak_explicit(
-        addr, &expected, new_bits,
-        memory_order_relaxed, memory_order_relaxed)) {
-        current_val = as_type<float>(expected);
-        new_val = current_val + value;
-        new_bits = as_type<uint>(new_val);
-    }
-}
 
 // CARAFE forward kernel - FP32
 kernel void carafe_forward_fp32(
@@ -224,11 +208,11 @@ kernel void carafe_forward_bf16(
 }
 
 // Backward for features - scatter gradients from output to input
-// Note: Uses atomic_float, no atomic_half/atomic_bfloat in Metal, so backward always FP32
+// Uses native atomic_float for optimal performance on Apple Silicon
 kernel void carafe_backward_features_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* masks [[buffer(1)]],
-    device atomic_uint* grad_features [[buffer(2)]],
+    device atomic_float* grad_features [[buffer(2)]],
     constant int& batch [[buffer(3)]],
     constant int& channels [[buffer(4)]],
     constant int& in_height [[buffer(5)]],
@@ -275,7 +259,7 @@ kernel void carafe_backward_features_fp32(
                 int feat_idx = b * channels * in_height * in_width +
                               c * in_height * in_width +
                               iy * in_width + ix;
-                atomic_add_float(&grad_features[feat_idx], grad_out_val * mask_val);
+                atomic_fetch_add_explicit(&grad_features[feat_idx], grad_out_val * mask_val, memory_order_relaxed);
             }
         }
     }
