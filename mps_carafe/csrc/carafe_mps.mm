@@ -7,6 +7,13 @@
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
 
+#include <mutex>
+#include <atomic>
+
+// Thread-safe initialization
+static std::mutex g_init_mutex;
+static std::atomic<bool> g_initialized{false};
+
 static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
 static id<MTLComputePipelineState> g_carafe_forward_fp32 = nil;
@@ -339,15 +346,28 @@ kernel void carafe_backward_masks_fp32(
 )";
 
 static void ensure_initialized() {
-    if (g_device != nil) return;
+    // Fast path: already initialized
+    if (g_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Slow path: acquire lock and initialize
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Double-check after acquiring lock
+    if (g_initialized.load(std::memory_order_relaxed)) {
+        return;
+    }
 
     g_device = MTLCreateSystemDefaultDevice();
+    TORCH_CHECK(g_device != nil, "Failed to create Metal device");
+
     NSError* error = nil;
 
     NSString* source = [NSString stringWithUTF8String:METAL_SHADER];
     g_library = [g_device newLibraryWithSource:source options:nil error:&error];
 
-    if (error) {
+    if (error || g_library == nil) {
         NSLog(@"Failed to compile Metal shader: %@", error);
         throw std::runtime_error("Failed to compile Metal shader");
     }
@@ -358,11 +378,26 @@ static void ensure_initialized() {
     id<MTLFunction> bwd_feat = [g_library newFunctionWithName:@"carafe_backward_features_fp32"];
     id<MTLFunction> bwd_mask = [g_library newFunctionWithName:@"carafe_backward_masks_fp32"];
 
+    TORCH_CHECK(fwd_fp32 && fwd_fp16 && fwd_bf16 && bwd_feat && bwd_mask,
+                "Failed to find Metal kernel functions");
+
     g_carafe_forward_fp32 = [g_device newComputePipelineStateWithFunction:fwd_fp32 error:&error];
+    TORCH_CHECK(g_carafe_forward_fp32, "Failed to create FP32 forward pipeline");
+
     g_carafe_forward_fp16 = [g_device newComputePipelineStateWithFunction:fwd_fp16 error:&error];
+    TORCH_CHECK(g_carafe_forward_fp16, "Failed to create FP16 forward pipeline");
+
     g_carafe_forward_bf16 = [g_device newComputePipelineStateWithFunction:fwd_bf16 error:&error];
+    TORCH_CHECK(g_carafe_forward_bf16, "Failed to create BF16 forward pipeline");
+
     g_carafe_backward_features_fp32 = [g_device newComputePipelineStateWithFunction:bwd_feat error:&error];
+    TORCH_CHECK(g_carafe_backward_features_fp32, "Failed to create features backward pipeline");
+
     g_carafe_backward_masks_fp32 = [g_device newComputePipelineStateWithFunction:bwd_mask error:&error];
+    TORCH_CHECK(g_carafe_backward_masks_fp32, "Failed to create masks backward pipeline");
+
+    // Mark as initialized
+    g_initialized.store(true, std::memory_order_release);
 }
 
 torch::Tensor carafe_forward_mps(
@@ -374,8 +409,14 @@ torch::Tensor carafe_forward_mps(
 ) {
     ensure_initialized();
 
+    // Device validation
     TORCH_CHECK(features.device().type() == torch::kMPS, "features must be on MPS");
     TORCH_CHECK(masks.device().type() == torch::kMPS, "masks must be on MPS");
+
+    // Parameter validation
+    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive, got ", kernel_size);
+    TORCH_CHECK(group_size > 0, "group_size must be positive, got ", group_size);
+    TORCH_CHECK(scale_factor > 0, "scale_factor must be positive, got ", scale_factor);
 
     int batch = features.size(0);
     int channels = features.size(1);
@@ -384,6 +425,12 @@ torch::Tensor carafe_forward_mps(
 
     int out_height = in_height * scale_factor;
     int out_width = in_width * scale_factor;
+
+    // Check for potential overflow
+    constexpr int64_t INT32_MAX_VAL = 2147483647LL;
+    int64_t grid_size = static_cast<int64_t>(out_width) * out_height * batch * channels;
+    TORCH_CHECK(grid_size <= INT32_MAX_VAL,
+                "Grid size overflow: ", grid_size, " exceeds int32 limit. Reduce tensor dimensions.");
 
     TORCH_CHECK(masks.size(0) == batch, "masks batch size mismatch");
     TORCH_CHECK(masks.size(1) == group_size * kernel_size * kernel_size,
@@ -451,6 +498,16 @@ std::tuple<torch::Tensor, torch::Tensor> carafe_backward_mps(
     int scale_factor
 ) {
     ensure_initialized();
+
+    // Device validation
+    TORCH_CHECK(grad_output.device().type() == torch::kMPS, "grad_output must be on MPS");
+    TORCH_CHECK(features.device().type() == torch::kMPS, "features must be on MPS");
+    TORCH_CHECK(masks.device().type() == torch::kMPS, "masks must be on MPS");
+
+    // Parameter validation
+    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
+    TORCH_CHECK(group_size > 0, "group_size must be positive");
+    TORCH_CHECK(scale_factor > 0, "scale_factor must be positive");
 
     int batch = features.size(0);
     int channels = features.size(1);

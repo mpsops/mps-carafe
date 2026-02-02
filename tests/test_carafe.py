@@ -1,4 +1,4 @@
-"""Test mps-carafe: FP32, FP16, BF16 support"""
+"""Test mps-carafe: FP32, FP16, BF16 support and validation"""
 
 import torch
 import time
@@ -8,6 +8,95 @@ print("Loading mps_carafe...")
 from mps_carafe import carafe, CARAFE, CARAFEPack, is_available
 
 print(f"MPS available: {is_available()}")
+
+
+# =============================================================================
+# Validation Tests
+# =============================================================================
+
+def test_kernel_size_validation():
+    """Test that kernel_size<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+    features = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    masks = torch.randn(B, 25, H*2, W*2, device='mps', dtype=torch.float32)
+
+    try:
+        carafe(features, masks, kernel_size=0, group_size=1, scale_factor=2)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "kernel_size" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  kernel_size=0 correctly rejected")
+        return True
+    return False
+
+
+def test_scale_factor_validation():
+    """Test that scale_factor<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+    features = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    masks = torch.randn(B, 25, H*2, W*2, device='mps', dtype=torch.float32)
+
+    try:
+        carafe(features, masks, kernel_size=5, group_size=1, scale_factor=0)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "scale_factor" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  scale_factor=0 correctly rejected")
+        return True
+    return False
+
+
+def test_group_size_validation():
+    """Test that group_size<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+    features = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    masks = torch.randn(B, 25, H*2, W*2, device='mps', dtype=torch.float32)
+
+    try:
+        carafe(features, masks, kernel_size=5, group_size=0, scale_factor=2)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "group_size" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  group_size=0 correctly rejected")
+        return True
+    return False
+
+
+def test_channels_divisibility():
+    """Test that channels must be divisible by group_size"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 5, 8, 8  # 5 channels, not divisible by 2
+    features = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    masks = torch.randn(B, 2*25, H*2, W*2, device='mps', dtype=torch.float32)
+
+    try:
+        carafe(features, masks, kernel_size=5, group_size=2, scale_factor=2)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "divisible" in str(e).lower()
+        print(f"  channels divisibility correctly checked")
+        return True
+    return False
+
+
+def test_device_mismatch():
+    """Test that masks on different device raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+    features = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    masks = torch.randn(B, 25, H*2, W*2, device='cpu', dtype=torch.float32)  # CPU!
+
+    try:
+        carafe(features, masks, kernel_size=5, group_size=1, scale_factor=2)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "device" in str(e).lower()
+        print(f"  device mismatch correctly rejected")
+        return True
+    return False
 
 def test_forward(dtype, name):
     """Test forward pass"""
@@ -233,6 +322,13 @@ if __name__ == "__main__":
     print("=" * 50)
 
     all_ok = True
+
+    print("\n0. Validation tests:")
+    all_ok &= test_kernel_size_validation()
+    all_ok &= test_scale_factor_validation()
+    all_ok &= test_group_size_validation()
+    all_ok &= test_channels_divisibility()
+    all_ok &= test_device_mismatch()
 
     print("\n1. Forward pass:")
     all_ok &= test_forward(torch.float32, "FP32")

@@ -9,8 +9,12 @@ import torch
 from torch import nn, Tensor
 from torch.autograd import Function
 from typing import Tuple
+import threading
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
+
+# Thread-safe library loading
+_lib_lock = threading.Lock()
 
 
 def _load_library():
@@ -37,10 +41,34 @@ _lib_cache = None
 
 
 def _get_lib():
+    """Thread-safe library loading."""
     global _lib_cache
     if _lib_cache is None:
-        _lib_cache = _load_library()
+        with _lib_lock:
+            # Double-check after acquiring lock
+            if _lib_cache is None:
+                _lib_cache = _load_library()
     return _lib_cache
+
+
+def _validate_params(kernel_size: int, group_size: int, scale_factor: int, channels: int) -> None:
+    """Validate CARAFE parameters."""
+    if kernel_size <= 0:
+        raise ValueError(f"kernel_size must be positive, got {kernel_size}")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
+    if scale_factor <= 0:
+        raise ValueError(f"scale_factor must be positive, got {scale_factor}")
+    if channels % group_size != 0:
+        raise ValueError(f"channels ({channels}) must be divisible by group_size ({group_size})")
+
+
+def _check_tensor_device(tensor: Tensor, name: str, expected_device: torch.device) -> None:
+    """Check that tensor is on the expected device."""
+    if tensor.device != expected_device:
+        raise ValueError(
+            f"{name} must be on same device as features ({expected_device}), got {tensor.device}"
+        )
 
 
 class _CARAFEFunction(Function):
@@ -55,6 +83,9 @@ class _CARAFEFunction(Function):
         group_size: int,
         scale_factor: int,
     ) -> Tensor:
+        # Device validation
+        _check_tensor_device(masks, "masks", features.device)
+
         ctx.save_for_backward(features, masks)
         ctx.kernel_size = kernel_size
         ctx.group_size = group_size
@@ -70,6 +101,11 @@ class _CARAFEFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         features, masks = ctx.saved_tensors
+
+        # Device validation for backward
+        if not grad_output.device.type == "mps":
+            raise ValueError(f"grad_output must be on MPS device, got {grad_output.device}")
+
         lib = _get_lib()
 
         grad_features, grad_masks = lib.carafe_backward(
@@ -99,15 +135,21 @@ def carafe(
     Args:
         features: Input feature map (N, C, H, W)
         masks: Reassembly kernels (N, group_size * kernel_size^2, H*scale, W*scale)
-        kernel_size: Size of the reassembly kernel (typically 5)
-        group_size: Number of groups for channel-wise reassembly
-        scale_factor: Upsampling factor (typically 2)
+        kernel_size: Size of the reassembly kernel (typically 5, must be positive)
+        group_size: Number of groups for channel-wise reassembly (must be positive)
+        scale_factor: Upsampling factor (typically 2, must be positive)
 
     Returns:
         Upsampled feature map (N, C, H*scale_factor, W*scale_factor)
+
+    Raises:
+        ValueError: If tensors not on MPS or parameters invalid.
     """
     if features.device.type != "mps":
         raise ValueError(f"Input must be on MPS device, got {features.device}")
+
+    channels = features.size(1)
+    _validate_params(kernel_size, group_size, scale_factor, channels)
 
     return _CARAFEFunction.apply(
         features, masks,
